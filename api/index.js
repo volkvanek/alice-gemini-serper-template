@@ -247,4 +247,51 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+    }
+
+    // Оставляем как минимум 200мс в запасе для записи в БД перед отдачей ответа
+    const answer = await askGemini(
+      text,
+      oldHistory,
+      searchContext,
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 800))
+    );
+
+    const history = [
+      ...oldHistory,
+      { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
+      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+    ].slice(-MAX_HISTORY_MESSAGES);
+
+    // 3. Запись обновленной истории в Supabase (с оставшимся бюджетом времени)
+    if (userId && SB_URL && SB_KEY) {
+      try {
+        await fetchJson(
+          `${SB_URL}/rest/v1/memory`,
+          {
+            method: 'POST',
+            headers: {
+              'apikey': SB_KEY,
+              'Authorization': `Bearer ${SB_KEY}`,
+              'Content-Type': 'application/json',
+              'Prefer': 'resolution=merge-duplicates'
+            },
+            body: JSON.stringify({ user_id: userId, history })
+          },
+          Math.max(150, remainingMs() - 100) // Используем оставшееся время, но не менее 150мс
+        );
+      } catch (e) {
+        console.warn("Failed to write to Supabase DB. Request ignored.");
+      }
+    }
+
+    return res.status(200).json(aliceResponse(answer, false));
+  } catch (error) {
+    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
+    return res.status(200).json(aliceResponse(errorForUser(safeError), false));
+  }
+}
+
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
