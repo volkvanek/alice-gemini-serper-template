@@ -232,8 +232,8 @@ export default async function handler(req, res) {
       if (response?.ok && Array.isArray(data) && data.length > 0) {
         oldHistory = safeHistory(data[0].history);
       }
-    } catch (e) {
-      console.warn("Failed to read Supabase DB. Continuing with empty history.");
+   } catch (e) {
+      console.warn("Failed to read Supabase DB:", e.message || e);
     }
   }
 
