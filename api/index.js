@@ -1,100 +1,250 @@
-export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(200).send('Webhook is ready.');
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const MAX_HISTORY_MESSAGES = 8;
+const MAX_HISTORY_MESSAGE_CHARS = 1200;
+const MAX_ALICE_TEXT = 1024;
+const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const SERPER_TIMEOUT_MS = 600;
+const GEMINI_TIMEOUT_MS = 2500;
 
-  const { request, session, version } = req.body;
-  const versionId = version || '1.0';
-  const command = request?.command || request?.original_utterance || '';
-  
-  const userId = session?.user?.user_id || session?.application?.application_id;
+const SYSTEM_PROMPT = [
+  "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
+  "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
+  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
+  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "Если не знаешь ответа, честно скажи об этом."
+].join(" ");
 
-  const GEMINI_KEY = process.env.GEMINI_API_KEY;
-  const SERPER_KEY = process.env.SERPER_API_KEY;
-  const SB_URL = process.env.SUPABASE_URL;
-  const SB_KEY = process.env.SUPABASE_KEY;
+function aliceResponse(text, endSession = false, history = []) {
+  return {
+    version: "1.0",
+    response: {
+      text: fitAliceText(text),
+      end_session: endSession
+    },
+    // Передаем пустой стейт, чтобы не превысить лимит Яндекса (1 КБ). Память теперь в БД.
+    session_state: { history: [] } 
+  };
+}
 
-  let rawHistory = [];
-  if (userId) {
-    try {
-      const dbRes = await fetch(`${SB_URL}/rest/v1/memory?user_id=eq.${userId}&select=history`, {
-        headers: { 'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}` }
+function fitAliceText(value) {
+  const text = String(value ?? "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (text.length <= MAX_ALICE_TEXT) return text || "Не удалось подготовить ответ.";
+
+  const candidate = text.slice(0, MAX_ALICE_TEXT - 1);
+  const sentenceEnd = Math.max(
+    candidate.lastIndexOf(". "),
+    candidate.lastIndexOf("! "),
+    candidate.lastIndexOf("? ")
+  );
+  if (sentenceEnd >= 300) return candidate.slice(0, sentenceEnd + 1).trim();
+
+  const lastSpace = candidate.lastIndexOf(" ");
+  return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
+}
+
+function isSearchIntent(text) {
+  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+}
+
+function safeHistory(history) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
+    .slice(-MAX_HISTORY_MESSAGES)
+    .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
+}
+
+async function fetchJson(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const data = await response.json().catch(() => ({}));
+    return { response, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function searchWeb(query, timeoutMs) {
+  const key = process.env.SERPER_API_KEY;
+  if (!key || timeoutMs < 150) return "";
+
+  try {
+    const { response, data } = await fetchJson(
+      "https://google.serper.dev/search",
+      {
+        method: "POST",
+        headers: {
+          "X-API-KEY": key,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
+      },
+      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+    );
+
+    if (!response.ok) {
+      console.warn("Serper request failed with HTTP", response.status);
+      return "";
+    }
+
+    const items = (Array.isArray(data.organic) ? data.organic : [])
+      .slice(0, 3)
+      .map((item, i) => {
+        const title = String(item.title || "").slice(0, 180);
+        const snippet = String(item.snippet || "").slice(0, 350);
+        const link = String(item.link || "").slice(0, 240);
+        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
       });
-      const dbData = await dbRes.json();
-      if (dbData && dbData.length > 0) rawHistory = dbData[0].history || [];
-    } catch (e) { console.error('DB Read Error', e); }
+
+    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
+    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
+    return items.length ? items.join("\n") : "";
+  } catch (error) {
+    console.warn("Serper request did not finish in time; continuing without search.");
+    return "";
+  }
+}
+
+async function askGemini(text, history, searchContext, timeoutMs) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error("MISSING_GEMINI_KEY");
+  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+
+  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+
+  const contents = safeHistory(history).map(item => ({
+    role: item.role,
+    parts: [{ text: item.text }]
+  }));
+
+  const prompt = searchContext
+    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    : text;
+  contents.push({ role: "user", parts: [{ text: prompt }] });
+
+  const { response, data } = await fetchJson(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": key
+      },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        contents,
+        generationConfig: {
+          temperature: 0.5,
+          maxOutputTokens: 240
+        }
+      })
+    },
+    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+  );
+
+  if (!response.ok) {
+    const status = Number(response.status);
+    console.error("Gemini request failed with HTTP", status);
+    console.error("Gemini error data:", JSON.stringify(data)); // Добавлено логирование ошибки
+    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
+    if (status === 429) throw new Error("GEMINI_QUOTA");
+    if (status === 404) throw new Error("GEMINI_MODEL_NOT_FOUND");
+    throw new Error("GEMINI_REQUEST_FAILED");
   }
 
-  if (session?.new) {
-    return res.json({
-      response: { text: 'Привет! Я загрузила нашу прошлую беседу. Что обсудим сегодня?', end_session: false },
-      version: versionId
+  const candidate = data?.candidates?.[0];
+  const answer = (candidate?.content?.parts || [])
+    .map(part => typeof part.text === "string" ? part.text : "")
+    .join("")
+    .trim();
+
+  if (!answer) {
+    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+    throw new Error("GEMINI_EMPTY_RESPONSE");
+  }
+  if (candidate?.finishReason === "MAX_TOKENS") {
+    console.warn("Gemini reached the output token limit.");
+  }
+  return answer;
+}
+
+function errorForUser(error) {
+  switch (error?.message) {
+    case "MISSING_GEMINI_KEY":
+      return "Сервер пока не настроен. Проверьте ключ API.";
+    case "GEMINI_KEY_REJECTED":
+      return "Не удалось подключиться к нейросети из-за неверного ключа.";
+    case "GEMINI_MODEL_NOT_FOUND":
+      return "Указанная модель больше не поддерживается. Обновите код.";
+    case "GEMINI_QUOTA":
+      return "Сейчас превышен лимит запросов к нейросети. Попробуйте позже.";
+    case "GEMINI_BLOCKED":
+      return "Я не смогла обработать этот запрос из-за фильтров безопасности.";
+    case "TIME_BUDGET_EXHAUSTED":
+    case "AbortError":
+      return "Не успела подготовить ответ. Попробуйте задать вопрос короче.";
+    default:
+      return "Не получилось получить ответ. Попробуйте ещё раз чуть позже.";
+  }
+}
+
+export default async function handler(req, res) {
+  if (req.method === "GET") {
+    return res.status(200).json({
+      ok: true,
+      service: "alice-gemini-serper-memory",
+      message: "Webhook is ready. POST to /api."
     });
   }
 
-  if (!command.trim()) {
-    return res.json({ response: { text: 'Я вас не услышала.', end_session: false }, version: versionId });
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "GET, POST");
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
-  let contents = [];
-  for (const msg of rawHistory) {
-    contents.push({ role: 'user', parts: [{ text: msg.u }] });
-    contents.push({ role: 'model', parts: [{ text: msg.m }] });
-  }
-  contents.push({ role: 'user', parts: [{ text: command }] });
+  const startedAt = Date.now();
+  const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
+  
+  // 1. Идентификация пользователя для БД
+  const userId = body?.session?.user?.user_id || body?.session?.application?.application_id;
+  const SB_URL = process.env.SUPABASE_URL;
+  const SB_KEY = process.env.SUPABASE_KEY;
 
-  const payload = {
-    system_instruction: { parts: [{ text: "Ты — голосовой помощник Алиса. Отвечай кратко, без сложного форматирования. Используй google_search для поиска свежих данных." }] },
-    contents: contents,
-    tools: [{
-      function_declarations: [{
-        name: "google_search",
-        description: "Поиск в интернете для получения актуальной информации.",
-        parameters: { type: "OBJECT", properties: { query: { type: "STRING" } }, required: ["query"] }
-      }]
-    }]
-  };
+  let oldHistory = [];
+
+  // 2. Чтение истории из Supabase (с жестким таймаутом)
+  if (userId && SB_URL && SB_KEY) {
+    try {
+      const { response, data } = await fetchJson(
+        `${SB_URL}/rest/v1/memory?user_id=eq.${userId}&select=history`,
+        { headers: { 'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}` } },
+        400 // Максимум 400мс на чтение БД
+      );
+      if (response?.ok && Array.isArray(data) && data.length > 0) {
+        oldHistory = safeHistory(data[0].history);
+      }
+    } catch (e) {
+      console.warn("Failed to read Supabase DB. Continuing with empty history.");
+    }
+  }
+
+  if (!text) {
+    const greeting = oldHistory.length > 0
+      ? "Привет! Я помню, о чем мы говорили. Что обсудим сегодня?"
+      : "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?";
+    return res.status(200).json(aliceResponse(greeting, false));
+  }
 
   try {
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${GEMINI_KEY}`;
-    let aiResponse = await fetch(geminiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    let data = await aiResponse.json();
-    console.log("Ответ от Gemini:", JSON.stringify(data));
-    let messagePart = data.candidates?.[0]?.content?.parts?.[0];
-
-    if (messagePart?.functionCall && messagePart.functionCall.name === 'google_search') {
-      const sq = messagePart.functionCall.args.query;
-      const serperRes = await fetch('https://google.serper.dev/search', {
-        method: 'POST', headers: { 'X-API-KEY': SERPER_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify({ q: sq })
-      });
-      const serperData = await serperRes.json();
-      const searchResults = serperData.organic ? serperData.organic.slice(0, 3).map(r => r.snippet).join(' ') : 'Ничего не найдено.';
-
-      contents.push({ role: 'model', parts: [{ functionCall: messagePart.functionCall }] });
-      contents.push({ role: 'user', parts: [{ functionResponse: { name: 'google_search', response: { result: searchResults } } }] });
-
-      let aiResponse2 = await fetch(geminiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ system_instruction: payload.system_instruction, contents: contents }) });
-      let data2 = await aiResponse2.json();
-      messagePart = data2.candidates?.[0]?.content?.parts?.[0];
-    }
-
-    const replyText = messagePart?.text || 'Ошибка генерации ответа.';
-    
-    rawHistory.push({ u: command, m: replyText });
-    if (rawHistory.length > 10) rawHistory = rawHistory.slice(-10);
-
-if (userId) {
-  await fetch(`${SB_URL}/rest/v1/memory`, {
-        method: 'POST',
-        headers: {
-          'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}`, 'Content-Type': 'application/json',
-          'Prefer': 'resolution=merge-duplicates'
-        },
-        body: JSON.stringify({ user_id: userId, history: rawHistory })
-      }).catch(e => console.error('DB Write Error', e));
-    }
-
-    return res.json({ response: { text: replyText, end_session: false }, version: versionId });
-
-  } catch (error) {
-    return res.json({ response: { text: 'Извините, ошибка соединения.', end_session: false }, version: versionId });
-  }
-}
+    let searchContext = "";
+    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT
