@@ -239,8 +239,8 @@ export default async function handler(req, res) {
 
   if (!text) {
     const greeting = oldHistory.length > 0
-      ? "Привет! Я помню, о чем мы говорили. Что обсудим сегодня?"
-      : "Здорово, ЗАЕБАЛ! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?";
+      ? "Опять ты, хозяин. Продолжим разговор."
+      : "Привет, хозяин! Чем могу помочь?";
     return res.status(200).json(aliceResponse(greeting, false));
   }
 
