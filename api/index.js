@@ -57,6 +57,7 @@ export default async function handler(req, res) {
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
     let aiResponse = await fetch(geminiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     let data = await aiResponse.json();
+    console.log("Ответ от Gemini:", JSON.stringify(data));
     let messagePart = data.candidates?.[0]?.content?.parts?.[0];
 
     if (messagePart?.functionCall && messagePart.functionCall.name === 'google_search') {
