@@ -267,8 +267,8 @@ export default async function handler(req, res) {
     // 3. Запись обновленной истории в Supabase (с оставшимся бюджетом времени)
     if (userId && SB_URL && SB_KEY) {
       try {
-        await fetchJson(
-          `${SB_URL}/rest/v1/memory`,
+        const { response, data } = await fetchJson(
+          `${SB_URL}/rest/v1/memory?on_conflict=user_id`, // Явно указываем первичный ключ для перезаписи
           {
             method: 'POST',
             headers: {
@@ -279,19 +279,18 @@ export default async function handler(req, res) {
             },
             body: JSON.stringify({ user_id: userId, history })
           },
-          Math.max(150, remainingMs() - 100) // Используем оставшееся время, но не менее 150мс
+          Math.max(150, remainingMs() - 100)
         );
+        
+        // Принудительно логируем результат записи
+        if (!response?.ok) {
+          console.error("Ошибка записи в БД. Статус:", response?.status, "Ответ:", JSON.stringify(data));
+        } else {
+          console.log("Диалог успешно сохранен в БД. Сообщений в памяти:", history.length);
+        }
       } catch (e) {
-        console.warn("Failed to write to Supabase DB. Request ignored.");
+        console.warn("Failed to write to Supabase DB:", e.message || e);
       }
     }
-
-    return res.status(200).json(aliceResponse(answer, false));
-  } catch (error) {
-    const safeError = (error?.name === "AbortError" || error?.message?.includes("aborted")) ? {message: "TIME_BUDGET_EXHAUSTED"} : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false));
-  }
-}
 
 export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
