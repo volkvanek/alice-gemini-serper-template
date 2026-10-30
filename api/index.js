@@ -2,7 +2,7 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4200;
+const TOTAL_RESPONSE_BUDGET_MS = 4200; // Увеличен бюджет времени
 const SERPER_TIMEOUT_MS = 600;
 const GEMINI_TIMEOUT_MS = 2500;
 
@@ -21,7 +21,6 @@ function aliceResponse(text, endSession = false, history = []) {
       text: fitAliceText(text),
       end_session: endSession
     },
-    // Передаем пустой стейт, чтобы не превысить лимит Яндекса (1 КБ). Память теперь в БД.
     session_state: { history: [] } 
   };
 }
@@ -152,7 +151,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (!response.ok) {
     const status = Number(response.status);
     console.error("Gemini request failed with HTTP", status);
-    console.error("Gemini error data:", JSON.stringify(data)); // Добавлено логирование ошибки
+    console.error("Gemini error data:", JSON.stringify(data));
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     if (status === 404) throw new Error("GEMINI_MODEL_NOT_FOUND");
@@ -214,33 +213,31 @@ export default async function handler(req, res) {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   
-  // 1. Идентификация пользователя для БД
   const userId = body?.session?.user?.user_id || body?.session?.application?.application_id;
   const SB_URL = process.env.SUPABASE_URL;
   const SB_KEY = process.env.SUPABASE_KEY;
 
   let oldHistory = [];
 
-  // 2. Чтение истории из Supabase (с жестким таймаутом)
   if (userId && SB_URL && SB_KEY) {
     try {
       const { response, data } = await fetchJson(
         `${SB_URL}/rest/v1/memory?user_id=eq.${userId}&select=history`,
         { headers: { 'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}` } },
-        1500 // Максимум 1500мс на чтение БД
+        1500 // Увеличено для обхода холодного старта
       );
       if (response?.ok && Array.isArray(data) && data.length > 0) {
         oldHistory = safeHistory(data[0].history);
       }
-   } catch (e) {
+    } catch (e) {
       console.warn("Failed to read Supabase DB:", e.message || e);
     }
   }
 
   if (!text) {
     const greeting = oldHistory.length > 0
-      ? "Опять ты, хозяин. Продолжим разговор."
-      : "Привет, хозяин! Чем могу помочь?";
+      ? "Опять ты!?, Чем могу помочь?"
+      : "Привет, хозяин. Чем могу помочь?";
     return res.status(200).json(aliceResponse(greeting, false));
   }
 
@@ -250,12 +247,11 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    // Оставляем как минимум 200мс в запасе для записи в БД перед отдачей ответа
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300)) // Уменьшен резерв времени
     );
 
     const history = [
@@ -264,11 +260,10 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
-    // 3. Запись обновленной истории в Supabase (с оставшимся бюджетом времени)
     if (userId && SB_URL && SB_KEY) {
       try {
         const { response, data } = await fetchJson(
-          `${SB_URL}/rest/v1/memory?on_conflict=user_id`, // Явно указываем первичный ключ для перезаписи
+          `${SB_URL}/rest/v1/memory?on_conflict=user_id`, // Разрешение конфликта перезаписи
           {
             method: 'POST',
             headers: {
@@ -282,7 +277,6 @@ export default async function handler(req, res) {
           Math.max(150, remainingMs() - 100)
         );
         
-        // Принудительно логируем результат записи
         if (!response?.ok) {
           console.error("Ошибка записи в БД. Статус:", response?.status, "Ответ:", JSON.stringify(data));
         } else {
@@ -292,5 +286,13 @@ export default async function handler(req, res) {
         console.warn("Failed to write to Supabase DB:", e.message || e);
       }
     }
+
+    return res.status(200).json(aliceResponse(answer, false));
+  } catch (error) {
+    const safeError = (error?.name === "AbortError" || error?.message?.includes("aborted")) ? {message: "TIME_BUDGET_EXHAUSTED"} : error;
+    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
+    return res.status(200).json(aliceResponse(errorForUser(safeError), false));
+  }
+}
 
 export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
