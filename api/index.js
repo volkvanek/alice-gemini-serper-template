@@ -81,8 +81,8 @@ export default async function handler(req, res) {
     rawHistory.push({ u: command, m: replyText });
     if (rawHistory.length > 10) rawHistory = rawHistory.slice(-10);
 
-    if (userId) {
-      fetch(`${SB_URL}/rest/v1/memory`, {
+if (userId) {
+  await fetch(`${SB_URL}/rest/v1/memory`, {
         method: 'POST',
         headers: {
           'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}`, 'Content-Type': 'application/json',
