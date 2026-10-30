@@ -2,7 +2,7 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SERPER_TIMEOUT_MS = 600;
 const GEMINI_TIMEOUT_MS = 2500;
 
@@ -227,7 +227,7 @@ export default async function handler(req, res) {
       const { response, data } = await fetchJson(
         `${SB_URL}/rest/v1/memory?user_id=eq.${userId}&select=history`,
         { headers: { 'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}` } },
-        800 // Максимум 800мс на чтение БД
+        500 // Максимум 500мс на чтение БД
       );
       if (response?.ok && Array.isArray(data) && data.length > 0) {
         oldHistory = safeHistory(data[0].history);
@@ -240,7 +240,7 @@ export default async function handler(req, res) {
   if (!text) {
     const greeting = oldHistory.length > 0
       ? "Привет! Я помню, о чем мы говорили. Что обсудим сегодня?"
-      : "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?";
+      : "Здорово, ЗАЕБАЛ! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?";
     return res.status(200).json(aliceResponse(greeting, false));
   }
 
@@ -255,7 +255,7 @@ export default async function handler(req, res) {
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 800))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300))
     );
 
     const history = [
@@ -288,7 +288,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = (error?.name === "AbortError" || error?.message?.includes("aborted")) ? {message: "TIME_BUDGET_EXHAUSTED"} : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false));
   }
