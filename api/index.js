@@ -227,7 +227,7 @@ export default async function handler(req, res) {
       const { response, data } = await fetchJson(
         `${SB_URL}/rest/v1/memory?user_id=eq.${userId}&select=history`,
         { headers: { 'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}` } },
-        500 // Максимум 500мс на чтение БД
+        1500 // Максимум 1500мс на чтение БД
       );
       if (response?.ok && Array.isArray(data) && data.length > 0) {
         oldHistory = safeHistory(data[0].history);
