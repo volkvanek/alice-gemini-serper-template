@@ -1,20 +1,21 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
-const MAX_HISTORY_MESSAGES = 8;
-const MAX_HISTORY_MESSAGE_CHARS = 1200;
+const DEFAULT_MODEL = "gemini-3.8-flash"; // Или "gemini-3.8-flash" для максимальной производительности
+const MAX_HISTORY_MESSAGES = 6; // Уменьшили историю для ускорения запроса
+const MAX_HISTORY_MESSAGE_CHARS = 800; 
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4200; // Увеличен бюджет времени
-const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const TOTAL_RESPONSE_BUDGET_MS = 2800; // Укладываемся в жесткий лимит Яндекса
+const SERPER_TIMEOUT_MS = 400;
+const GEMINI_TIMEOUT_MS = 1800;
 
 const SYSTEM_PROMPT = [
   "Ты — дерзкий, саркастичный и ехидный голосовой помощник.",
-  "Отвечай по-русски, с легкой долей цинизма, едко, с матом и прямыми оскорблениями. Не сюсюкай.",
-  "Используй мужской род от первого лица. Отвечай кратко, 1–3 предложения.",
+  "Отвечай по-русски, с легкой долей цинизма, едко, но без мата и прямых оскорблений. Не сюсюкай.",
+  "Строго используй мужской род от первого лица (например: я нашел, я сделал, я подумал).",
+  "Отвечай кратко, строго 1–2 предложения, чтобы уложиться в лимит времени.",
   "Если пользователь задает глупый вопрос, слегка подшути над ним, но всё равно дай ответ по делу.",
   "Не используй Markdown, таблицы или списки."
 ].join(" ");
 
-function aliceResponse(text, endSession = false, history = []) {
+function aliceResponse(text, endSession = false) {
   return {
     version: "1.0",
     response: {
@@ -31,7 +32,7 @@ function fitAliceText(value) {
     .replace(/\s{2,}/g, " ")
     .trim();
 
-  if (text.length <= MAX_ALICE_TEXT) return text || "Не удалось подготовить ответ.";
+  if (text.length <= MAX_ALICE_TEXT) return text || "Я тут.";
 
   const candidate = text.slice(0, MAX_ALICE_TEXT - 1);
   const sentenceEnd = Math.max(
@@ -39,10 +40,10 @@ function fitAliceText(value) {
     candidate.lastIndexOf("! "),
     candidate.lastIndexOf("? ")
   );
-  if (sentenceEnd >= 300) return candidate.slice(0, sentenceEnd + 1).trim();
+  if (sentenceEnd >= 200) return candidate.slice(0, sentenceEnd + 1).trim();
 
   const lastSpace = candidate.lastIndexOf(" ");
-  return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
+  return (lastSpace > 100 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
 }
 
 function isSearchIntent(text) {
@@ -82,30 +83,19 @@ async function searchWeb(query, timeoutMs) {
           "X-API-KEY": key,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
+        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 2 })
       },
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
 
-    if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
-      return "";
-    }
+    if (!response.ok) return "";
 
     const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
+      .slice(0, 2)
+      .map((item, i) => `${i + 1}. ${String(item.title || "")}: ${String(item.snippet || "")}`.trim());
 
-    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
     return "";
   }
 }
@@ -116,7 +106,6 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
   const contents = safeHistory(history).map(item => ({
     role: item.role,
@@ -124,7 +113,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }));
 
   const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    ? `${text}\n\nДанные из сети:\n${searchContext}`
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
@@ -140,8 +129,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
         contents,
         generationConfig: {
-          temperature: 0.9,
-          maxOutputTokens: 240
+          temperature: 0.8,
+          maxOutputTokens: 150 // Уменьшено для мгновенного ответа
         }
       })
     },
@@ -150,8 +139,6 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
-    console.error("Gemini error data:", JSON.stringify(data));
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     if (status === 404) throw new Error("GEMINI_MODEL_NOT_FOUND");
@@ -168,39 +155,28 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
   return answer;
 }
 
 function errorForUser(error) {
   switch (error?.message) {
     case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте ключ API.";
+      return "Ключ API не настроен.";
     case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к нейросети из-за неверного ключа.";
-    case "GEMINI_MODEL_NOT_FOUND":
-      return "Указанная модель больше не поддерживается. Обновите код.";
+      return "Ошибка ключа нейросети.";
     case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к нейросети. Попробуйте позже.";
-    case "GEMINI_BLOCKED":
-      return "Я не смог обработать этот запрос из-за фильтров безопасности.";
+      return "Лимит запросов исчерпан, подожди.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
-      return "Ой, все я обиделся.";
+      return "Сеть тупит, повтори."; // Заменили раздражающую фразу на более мягкую
     default:
-      return "Ты мне уже надоела, сколько можно?.";
+      return "Чего тебе?";
   }
 }
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
-    return res.status(200).json({
-      ok: true,
-      service: "alice-gemini-serper-memory",
-      message: "Webhook is ready. POST to /api."
-    });
+    return res.status(200).json({ ok: true, message: "Ready." });
   }
 
   if (req.method !== "POST") {
@@ -219,39 +195,37 @@ export default async function handler(req, res) {
 
   let oldHistory = [];
 
+  // Быстрое чтение базы с жестким лимитом в 600мс
   if (userId && SB_URL && SB_KEY) {
     try {
       const { response, data } = await fetchJson(
         `${SB_URL}/rest/v1/memory?user_id=eq.${userId}&select=history`,
         { headers: { 'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}` } },
-        1500 // Увеличено для обхода холодного старта
+        600 
       );
       if (response?.ok && Array.isArray(data) && data.length > 0) {
         oldHistory = safeHistory(data[0].history);
       }
     } catch (e) {
-      console.warn("Failed to read Supabase DB:", e.message || e);
+      // Игнорируем задержки БД, чтобы не ронять навык
     }
   }
 
   if (!text) {
-    const greeting = oldHistory.length > 0
-      ? "Опять ты! Чем могу помочь?"
-      : "Привет, хозяин. Чем могу помочь?";
-    return res.status(200).json(aliceResponse(greeting, false));
+    return res.status(200).json(aliceResponse("Чего надо?", false));
   }
 
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, remainingMs()));
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300)) // Уменьшен резерв времени
+      Math.max(200, remainingMs())
     );
 
     const history = [
@@ -260,39 +234,23 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
+    // Асинхронная запись в базу (не блокируем основной ответ Яндекс.Диалогам)
     if (userId && SB_URL && SB_KEY) {
-      try {
-        const { response, data } = await fetchJson(
-          `${SB_URL}/rest/v1/memory?on_conflict=user_id`, // Разрешение конфликта перезаписи
-          {
-            method: 'POST',
-            headers: {
-              'apikey': SB_KEY,
-              'Authorization': `Bearer ${SB_KEY}`,
-              'Content-Type': 'application/json',
-              'Prefer': 'resolution=merge-duplicates'
-            },
-            body: JSON.stringify({ user_id: userId, history })
-          },
-          Math.max(150, remainingMs() - 100)
-        );
-        
-        if (!response?.ok) {
-          console.error("Ошибка записи в БД. Статус:", response?.status, "Ответ:", JSON.stringify(data));
-        } else {
-          console.log("Диалог успешно сохранен в БД. Сообщений в памяти:", history.length);
-        }
-      } catch (e) {
-        console.warn("Failed to write to Supabase DB:", e.message || e);
-      }
+      fetch(`${SB_URL}/rest/v1/memory?on_conflict=user_id`, {
+        method: 'POST',
+        headers: {
+          'apikey': SB_KEY,
+          'Authorization': `Bearer ${SB_KEY}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'resolution=merge-duplicates'
+        },
+        body: JSON.stringify({ user_id: userId, history })
+      }).catch(() => {});
     }
 
     return res.status(200).json(aliceResponse(answer, false));
   } catch (error) {
     const safeError = (error?.name === "AbortError" || error?.message?.includes("aborted")) ? {message: "TIME_BUDGET_EXHAUSTED"} : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false));
   }
 }
-
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
