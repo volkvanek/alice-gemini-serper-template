@@ -1,4 +1,4 @@
-const DEFAULT_MODEL = "gemini-3.8-flash"; // Или "gemini-3.8-flash" для максимальной производительности
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 6; // Уменьшили историю для ускорения запроса
 const MAX_HISTORY_MESSAGE_CHARS = 800; 
 const MAX_ALICE_TEXT = 1024;
